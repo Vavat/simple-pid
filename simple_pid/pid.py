@@ -1,22 +1,19 @@
 def _clamp(value, limits):
     lower, upper = limits
-    if value is None:
-        return None
-    elif (upper is not None) and (value > upper):
-        return upper
+    if (upper is not None) and (value > upper):
+        value = upper
     elif (lower is not None) and (value < lower):
-        return lower
+        value = lower
     return value
-
 
 class PID(object):
     """A simple PID controller."""
 
     def __init__(
         self,
-        Kp=1.0,
-        Ki=0.0,
-        Kd=0.0,
+        k_proportional=1.0,
+        k_integral=0.0,
+        k_differential=0.0,
         setpoint=0,
         sample_time=0.01,
         output_limits=(None, None),
@@ -25,14 +22,14 @@ class PID(object):
         differential_on_measurement=True,
         error_map=None,
         time_fn=None,
-        starting_output=0.0,
+        integral_preload=0.0,
     ):
         """
         Initialize a new PID controller.
 
-        :param Kp: The value for the proportional gain Kp
-        :param Ki: The value for the integral gain Ki
-        :param Kd: The value for the derivative gain Kd
+        :param k_proportional: The value for the proportional gain k_proportional
+        :param  k_integral: The value for the integral gain k_integral
+        :param k_differential: The value for the derivative gain k_differential
         :param setpoint: The initial setpoint that the PID will try to achieve
         :param sample_time: The time in seconds which the controller should wait before generating
             a new output value. The PID works best when it is constantly called (eg. during a
@@ -55,12 +52,12 @@ class PID(object):
             default. This should be a function taking no arguments and returning a number
             representing the current time. The default is to use time.monotonic() if available,
             otherwise time.time().
-        :param starting_output: The starting point for the PID's output. If you start controlling
+        :param integral_preload: The starting point for the PID's output. If you start controlling
             a system that is already at the setpoint, you can set this to your best guess at what
             output the PID should give when first calling it to avoid the PID outputting zero and
             moving the system away from the setpoint.
         """
-        self.Kp, self.Ki, self.Kd = Kp, Ki, Kd
+        self.k_proportional, self.k_integral, self.k_differential = k_proportional, k_integral, k_differential
         self.setpoint = setpoint
         self.sample_time = sample_time
 
@@ -70,9 +67,9 @@ class PID(object):
         self.differential_on_measurement = differential_on_measurement
         self.error_map = error_map
 
-        self._proportional = 0
-        self._integral = 0
-        self._derivative = 0
+        self.p_term = 0
+        self.i_term = 0
+        self.d_term = 0
 
         self._last_time = None
         self._last_output = None
@@ -96,65 +93,56 @@ class PID(object):
         self.reset()
 
         # Set initial state of the controller
-        self._integral = _clamp(starting_output, output_limits)
+        self.i_term = _clamp(integral_preload, output_limits)
 
-    def __call__(self, input_, dt=None):
+    def __call__(self, controlled_value, delta_t=None):
         """
         Update the PID controller.
 
-        Call the PID controller with *input_* and calculate and return a control output if
+        Call the PID controller with *controlled_value* and calculate and return a control output if
         sample_time seconds has passed since the last update. If no new output is calculated,
         return the previous output instead (or None if no value has been calculated yet).
 
-        :param dt: If set, uses this value for timestep instead of real time. This can be used in
+        :param delta_t: If set, uses this value for timestep instead of real time. This can be used in
             simulations when simulation time is different from real time.
         """
         if not self.auto_mode:
             return self._last_output
 
         now = self.time_fn()
-        if dt is None:
-            dt = now - self._last_time if (now - self._last_time) else 1e-16
-        elif dt <= 0:
-            raise ValueError('dt has negative value {}, must be positive'.format(dt))
-
-        if self.sample_time is not None and dt < self.sample_time and self._last_output is not None:
-            # Only update every sample_time seconds
-            return self._last_output
+        if delta_t is None:
+            delta_t = now - self._last_time if (now - self._last_time) else 1e-16
+        elif delta_t <= 0:
+            raise ValueError('delta_t has negative value {}, must be positive'.format(delta_t))
 
         # Compute error terms
-        error = self.setpoint - input_
-        d_input = input_ - (self._last_input if (self._last_input is not None) else input_)
-        d_error = error - (self._last_error if (self._last_error is not None) else error)
+        error = self.setpoint - controlled_value
+        delta_error = error - self._last_error # N.B.: not time normalised
 
-        # Check if must map the error
-        if self.error_map is not None:
-            error = self.error_map(error)
+        # Compute terms: proportional and differential
+        self.p_term = self.k_proportional * error 
+        old_i_term = self.i_term
+        self.i_term += self.k_integral * error * delta_t
+        self.d_term = self.k_differential* delta_error / delta_t
 
-        # Compute the proportional term
-        if not self.proportional_on_measurement:
-            # Regular proportional-on-error, simply set the proportional term
-            self._proportional = self.Kp * error
-        else:
-            # Add the proportional error on measurement to error_sum
-            self._proportional -= self.Kp * d_input
+        output = self.p_term + self.i_term + self.d_term
 
-        # Compute integral and derivative terms
-        self._integral += self.Ki * error * dt
-        self._integral = _clamp(self._integral, self.output_limits)  # Avoid integral windup
-
-        if self.differential_on_measurement:
-            self._derivative = -self.Kd * d_input / dt
-        else:
-            self._derivative = self.Kd * d_error / dt
-
-        # Compute final output
-        output = self._proportional + self._integral + self._derivative
-        output = _clamp(output, self.output_limits)
-
+        # Limit checking of the output and windup prevention
+        minimum_output, maximum_output = self.output_limits
+        if output < minimum_output:
+            output = minimum_output
+            # if lower limit is hit, then prevent integral from reducing further
+            if self.i_term < old_i_term:
+                self.i_term = old_i_term
+        elif output > maximum_output:
+            output = maximum_output
+            # if upper limit is hit, then prevent integral from increasing further
+            if self.i_term > old_i_term:
+                self.i_term = old_i_term
+        
         # Keep track of state
         self._last_output = output
-        self._last_input = input_
+        self._last_input = controlled_value
         self._last_error = error
         self._last_time = now
 
@@ -163,7 +151,7 @@ class PID(object):
     def __repr__(self):
         return (
             '{self.__class__.__name__}('
-            'Kp={self.Kp!r}, Ki={self.Ki!r}, Kd={self.Kd!r}, '
+            'k_proportional={self.k_proportional!r}, k_integral={self.k_integral!r}, k_differential={self.k_differential!r}, '
             'setpoint={self.setpoint!r}, sample_time={self.sample_time!r}, '
             'output_limits={self.output_limits!r}, auto_mode={self.auto_mode!r}, '
             'proportional_on_measurement={self.proportional_on_measurement!r}, '
@@ -178,17 +166,17 @@ class PID(object):
         The P-, I- and D-terms from the last computation as separate components as a tuple. Useful
         for visualizing what the controller is doing or when tuning hard-to-tune systems.
         """
-        return self._proportional, self._integral, self._derivative
+        return self.p_term, self.i_term, self.d_term
 
     @property
     def tunings(self):
-        """The tunings used by the controller as a tuple: (Kp, Ki, Kd)."""
-        return self.Kp, self.Ki, self.Kd
+        """The tunings used by the controller as a tuple: (k_proportional,  k_integral, k_differential)."""
+        return self.k_proportional, self.k_integral, self.k_differential
 
     @tunings.setter
     def tunings(self, tunings):
         """Set the PID tunings."""
-        self.Kp, self.Ki, self.Kd = tunings
+        self.k_proportional, self.k_integral, self.k_differential = tunings
 
     @property
     def auto_mode(self):
@@ -218,8 +206,8 @@ class PID(object):
             # Switching from manual mode to auto, reset
             self.reset()
 
-            self._integral = last_output if (last_output is not None) else 0
-            self._integral = _clamp(self._integral, self.output_limits)
+            self.i_term = last_output if (last_output is not None) else 0
+            self.i_term = _clamp(self.i_term, self.output_limits)
 
         self._auto_mode = enabled
 
@@ -247,7 +235,7 @@ class PID(object):
         self._min_output = min_output
         self._max_output = max_output
 
-        self._integral = _clamp(self._integral, self.output_limits)
+        self.i_term = _clamp(self.i_term, self.output_limits)
         self._last_output = _clamp(self._last_output, self.output_limits)
 
     def reset(self):
@@ -257,11 +245,11 @@ class PID(object):
         This sets each term to 0 as well as clearing the integral, the last output and the last
         input (derivative calculation).
         """
-        self._proportional = 0
-        self._integral = 0
-        self._derivative = 0
+        self.p_term = 0
+        self.i_term = 0
+        self.d_term = 0
 
-        self._integral = _clamp(self._integral, self.output_limits)
+        self.i_term = _clamp(self.i_term, self.output_limits)
 
         self._last_time = self.time_fn()
         self._last_output = None
