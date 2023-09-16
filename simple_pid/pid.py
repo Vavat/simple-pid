@@ -71,7 +71,6 @@ class PID(object):
         self.i_term = 0
         self.d_term = 0
 
-        self._last_time = None
         self._last_output = None
         self._last_error = None
         self._last_input = None
@@ -88,6 +87,7 @@ class PID(object):
             except AttributeError:
                 # time.monotonic() not available (using python < 3.3), fallback to time.time()
                 self.time_fn = time.time
+        self._last_time = self.time_fn()
 
         self.output_limits = output_limits
         self.reset()
@@ -109,11 +109,13 @@ class PID(object):
         if not self.auto_mode:
             return self._last_output
 
-        now = self.time_fn()
-        if delta_t is None:
-            delta_t = now - self._last_time if (now - self._last_time) else 1e-16
+        if self.time_fn is not None:
+            now = self.time_fn()
+            delta_t = now - self._last_time
+        elif delta_t is None:
+            raise ValueError('delta_t must be provided when time function is not specified.')
         elif delta_t <= 0:
-            raise ValueError('delta_t has negative value {}, must be positive'.format(delta_t))
+            raise ValueError('delta_t = {}, but it must be positive'.format(delta_t))
 
         # Compute error terms
         error = self.setpoint - controlled_value
